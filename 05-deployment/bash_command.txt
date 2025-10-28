@@ -1,0 +1,100 @@
+    uvicorn predict:app --host 0.0.0.0 --port 9696 --reload
+
+
+curl -X 'POST' 'http://localhost:9696/predict' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "lead_source": "organic_search",
+    "number_of_courses_viewed": 4,
+    "annual_income": 80304.0
+}
+
+docker build -t predict-convert .
+
+docker run -it --rm -p 9696:9696 predict-convert
+
+docker run -it --rm --network bridge -p 9696:9696 predict-convert
+
+
+The Root Problem:
+it was stale port bindings on your host system (Windows)
+TCP    0.0.0.0:9696  LISTENING       23868
+TCP    0.0.0.0:9696  LISTENING       23000
+TCP    127.0.0.1:9696  127.0.0.1:49684  CLOSE_WAIT  23868
+
+That showed:
+Multiple processes were simultaneously bound to port 9696, likely from previous containers or runs.
+One connection was stuck in CLOSE_WAIT, meaning your client (test.py) tried to connect to an old/stuck process, and the OS kept the socket half-open.
+Because of that, new requests never reached your running FastAPI app, so curl and test.py appeared to hang.
+
+What Fixed It
+The fix worked because we did a full reset of the port and container state:
+1. Stopped all containers
+    docker stop $(docker ps -q)
+
+→ closed all running Uvicorn instances, freeing up the port.
+
+2. Confirmed port cleanup
+    netstat -ano | findstr 9696
+
+→ ensured nothing was still listening.
+
+3. Relaunched a single clean container
+    docker run -p 9696:9696 predict-convert
+
+→ created a fresh, unconflicted mapping between 0.0.0.0:9696 (container) and 127.0.0.1:9696 (host).
+
+At that point, curl and test.py started working because Windows now routed requests correctly to the only active container.
+
+🧠 Rule of thumb:
+If docker logs looks fine but curl hangs → run:
+docker ps
+netstat -ano | findstr <port>
+Then stop and clear any conflicting PIDs.
+
+
+Clean Working Example — Using uv Properly
+# Base image from Zoomcamp
+FROM agrigorev/zoomcamp-model:2025
+
+# Set working directory
+WORKDIR /code
+
+# Install uv (new Python package manager)
+RUN pip install --no-cache-dir uv
+
+# Copy dependency files
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies using uv
+RUN uv sync --frozen --no-dev
+
+# Copy application code and model
+COPY predict.py pipeline_v1.bin ./
+
+# Expose the API port
+EXPOSE 9696
+
+# Run the FastAPI app via uv (executes uvicorn)
+CMD ["uv", "run", "uvicorn", "predict:app", "--host", "0.0.0.0", "--port", "9696"]
+
+# Rebuild the image
+docker build -t predict-convert-uv .
+
+# Run the container
+docker run -it --rm -p 9696:9696 predict-convert-uv
+
+Verification Checklist
+After running:
+- Logs should show:
+✅ Model loaded successfully
+Uvicorn running on http://0.0.0.0:9696
+
+- Then test:
+curl http://127.0.0.1:9696
+→ should return { "message": "API is running" }
+
+and
+python test.py
+→ should print prediction results.
